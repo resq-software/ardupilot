@@ -1,0 +1,4 @@
+# Default owner for all files in resq-software/ardupilot.
+# This is a fork of ArduPilot/ardupilot; upstream changes land on
+# `master` via dedicated sync PRs owned by the same maintainer.
+* @WomB0ComB0
