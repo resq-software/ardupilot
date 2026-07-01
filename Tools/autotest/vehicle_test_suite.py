@@ -19,6 +19,7 @@ import math
 import operator
 import os
 import pathlib
+import queue
 import random
 import re
 import shutil
@@ -60,11 +61,6 @@ from pymavlink.rotmat import Vector3
 
 from pysim import util
 from pysim import vehicleinfo
-
-try:
-    import queue as Queue
-except ImportError:
-    import Queue
 
 
 # Enumeration convenience class for mavlink POSITION_TARGET_TYPEMASK
@@ -200,6 +196,9 @@ class PreconditionFailedException(ErrorException):
 class ArmedAtEndOfTestException(ErrorException):
     """Created when test left vehicle armed"""
     pass
+
+
+NUM_RC_CHANNELS = 16
 
 
 class Context(object):
@@ -2052,9 +2051,9 @@ class TestSuite(abc.ABC):
         self.tlog = None
         self.enable_fgview = enable_fgview
 
-        self.rc_thread = None
-        self.rc_thread_should_quit = False
-        self.rc_queue = Queue.Queue()
+        self.rc_thread: threading.Thread | None = None
+        self.rc_thread_should_quit: bool = False
+        self.rc_queue = queue.Queue()
 
         self.expect_list = []
 
@@ -2086,7 +2085,7 @@ class TestSuite(abc.ABC):
             self.rc_thread = None
 
     def default_speedup(self):
-        return 8
+        return 100
 
     def progress(self, text, send_statustext=True):
         """Display autotest progress text."""
@@ -3097,6 +3096,16 @@ class TestSuite(abc.ABC):
         self.drain_mav()
         self.wait_heartbeat()
         self.set_streamrate(self.sitl_streamrate())
+        # it takes some time for the autopilot to debounce the RC mode
+        # channel.  If we return straight away then the caller can
+        # change mode using a mavlink command and then the autopilot
+        # processes the debounced RC flight-mode channel, meaning the
+        # mode is changed from underneath the caller.  Wait for some
+        # RC messages to come in - that means we are running the main
+        # loop, at least.  Note that the "set_streamrate" call above
+        # can be handled in a delay callback.
+        for i in range(0, 3):
+            self.assert_receive_message('RC_CHANNELS')
         self.progress("Reboot complete")
 
     def customise_SITL_commandline(self,
@@ -3133,7 +3142,11 @@ class TestSuite(abc.ABC):
         else:
             self.set_streamrate(self.sitl_streamrate())
 
-        self.assert_receive_message('RC_CHANNELS', timeout=15)
+        # mode switch needs to be debounced; waiting for more
+        # RC_CHANNELS doesn't necessarily mean we have done that, but
+        # it won't hurt
+        for i in range(0, 3):
+            self.assert_receive_message('RC_CHANNELS')
 
         # stash our arguments in case we need to preserve them in
         # reboot_sitl with Valgrind active:
@@ -3846,13 +3859,13 @@ class TestSuite(abc.ABC):
         if ex is not None:
             raise ex
 
-    def download_full_log_list(self, print_logs=True):
+    def download_full_log_list(self, print_logs=True, LOG_ENTRY_sanity_check=True):
         tstart = self.get_sim_time()
         self.mav.mav.log_request_list_send(self.sysid_thismav(),
                                            1, # target component
                                            0,
                                            0xffff)
-        logs = {}
+        logs : dict[int : mavutil.MAVLink.MAVLink_log_entry_message] = {}
         last_id = None
         num_logs = None
         while True:
@@ -3888,7 +3901,8 @@ class TestSuite(abc.ABC):
                 break
 
         # ensure we don't get any extras:
-        self.assert_not_receiving_message('LOG_ENTRY', timeout=2)
+        if LOG_ENTRY_sanity_check:
+            self.assert_not_receiving_message('LOG_ENTRY', timeout=2)
 
         return logs
 
@@ -5808,24 +5822,7 @@ class TestSuite(abc.ABC):
         return path
 
     def rc_defaults(self):
-        return {
-            1: 1500,
-            2: 1500,
-            3: 1500,
-            4: 1500,
-            5: 1500,
-            6: 1500,
-            7: 1500,
-            8: 1500,
-            9: 1500,
-            10: 1500,
-            11: 1500,
-            12: 1500,
-            13: 1500,
-            14: 1500,
-            15: 1500,
-            16: 1500,
-        }
+        return {channel: 1500 for channel in range(1, NUM_RC_CHANNELS+1)}
 
     def set_rc_from_map(self, _map, *, timeout: float | int | None = 20.0, quiet=False):
         """Sets provided RC channel/value pairs.
@@ -5870,54 +5867,39 @@ class TestSuite(abc.ABC):
                 raise ValueError("RC thread is dead")  # FIXME: type
 
     def rc_thread_main(self):
-        chan16 = [1000] * 16
-
+        """When this function completes, the thread terminates."""
         sitl_output = mavutil.mavudp("127.0.0.1:%u" % self.sitl_rcin_port(), input=False)
-        buf = None
 
-        while True:
-            if self.rc_thread_should_quit:
-                break
+        # Pay attention, there are race conditions /
+        # wallclock-vs-simtime issues to worry about here.
+        max_wait_before_sending_values = 0.2 / self.speedup
 
-            # the 0.05 here means we're updating the RC values into
-            # the autopilot at 20Hz - that's our 50Hz wallclock, , not
-            # the autopilot's simulated 20Hz, so if speedup is 10 the
-            # autopilot will see ~2Hz.
-            timeout = 0.02
-            # ... and 2Hz is too slow when we now run at 100x speedup:
-            timeout /= (self.speedup / 10.0)
-
+        format_str = "<" + "H" * NUM_RC_CHANNELS
+        rc_values = [1000] * NUM_RC_CHANNELS
+        while not self.rc_thread_should_quit:
             try:
-                map_copy = self.rc_queue.get(timeout=timeout)
-
-                # 16 packed entries:
-                for i in range(1, 17):
-                    if i in map_copy:
-                        chan16[i-1] = map_copy[i]
-
-            except Queue.Empty:
+                rc_value_updates = self.rc_queue.get(timeout=max_wait_before_sending_values)
+                for chan, val in rc_value_updates.items():
+                    if not isinstance(chan, int):
+                        raise ValueError(f"{chan} is not a valid RC channel, must be an int.")
+                    if not (1 <= chan <= NUM_RC_CHANNELS):
+                        raise ValueError(f"{chan} is not a valid RC channel, must be in range [1, {NUM_RC_CHANNELS}].")
+                    rc_values[chan-1] = val
+            except queue.Empty:
                 pass
-
-            buf = struct.pack('<HHHHHHHHHHHHHHHH', *chan16)
-
-            if buf is None:
-                continue
-
-            sitl_output.write(buf)
+            sitl_output.write(struct.pack(format_str, *rc_values))
 
     def set_rc_default(self):
-        """Setup all simulated RC control to 1500."""
+        """Set all channels of simulated RC control to the default value (typically 1500)."""
         _defaults = self.rc_defaults()
         self.set_rc_from_map(_defaults)
 
     def check_rc_defaults(self):
         """Ensure all rc outputs are at defaults"""
         self.do_timesync_roundtrip()
-        _defaults = self.rc_defaults()
         m = self.assert_receive_message('RC_CHANNELS', timeout=5)
         need_set = {}
-        for chan in _defaults:
-            default_value = _defaults[chan]
+        for chan, default_value in self.rc_defaults().items():
             current_value = getattr(m, "chan" + str(chan) + "_raw")
             if default_value != current_value:
                 self.progress("chan=%u needs resetting is=%u want=%u" %
@@ -6136,10 +6118,10 @@ class TestSuite(abc.ABC):
     def wait_armed(self, timeout=20):
         tstart = self.get_sim_time()
         while self.get_sim_time_cached() - tstart < timeout:
-            self.wait_heartbeat(drain_mav=False)
             if self.mav.motors_armed():
                 self.progress("Motors ARMED")
                 return
+            self.wait_heartbeat(drain_mav=False)
         raise AutoTestTimeoutException("Did not become armed")
 
     def disarm_vehicle(self, timeout=60, force=False):
@@ -6913,6 +6895,9 @@ class TestSuite(abc.ABC):
     def sysid_thismav(self):
         return 1
 
+    def compid_thismav(self):
+        return 1
+
     def create_MISSION_ITEM_INT(
             self,
             t,
@@ -7301,10 +7286,9 @@ class TestSuite(abc.ABC):
 
     def change_mode(self, mode, timeout=60):
         '''change vehicle flightmode'''
-        self.wait_heartbeat()
         self.progress("Changing mode to %s" % mode)
-        self.send_cmd_do_set_mode(mode)
         tstart = self.get_sim_time()
+        self.send_cmd_do_set_mode(mode)
         while not self.mode_is(mode):
             custom_num = self.mav.messages['HEARTBEAT'].custom_mode
             self.progress("mav.flightmode=%s Want=%s custom=%u" % (
@@ -9000,7 +8984,8 @@ Also, ignores heartbeats not from our target system'''
             m = self.mav.wait_heartbeat(*args, **x)
             if m is None:
                 continue
-            if m.get_srcSystem() == self.sysid_thismav():
+            if (m.get_srcSystem() == self.sysid_thismav() and
+                    m.get_srcComponent() == self.compid_thismav()):
                 return m
 
     def wait_ekf_happy(self, require_absolute=True, **kwargs):
@@ -9192,7 +9177,7 @@ Also, ignores heartbeats not from our target system'''
         dest = os.path.join("scripts", "modules", "mavlink")
         ardupilotmega_xml = os.path.join(self.rootdir(), "modules", "mavlink",
                                          "message_definitions", "v1.0", "ardupilotmega.xml")
-        mavgen.mavgen(mavgen.Opts(output=dest, wire_protocol='2.0', language='Lua'), [ardupilotmega_xml])
+        mavgen.mavgen(mavgen.Opts(output=dest, wire_protocol='2.0', language='Lua', validate=False), [ardupilotmega_xml])
         self.progress("Installed mavlink module")
 
     def install_script_content(self, scriptname, content):
@@ -9456,7 +9441,7 @@ Also, ignores heartbeats not from our target system'''
                     self.message_hooks.remove(h)
             hooks_removed = True
         self.test_timings[desc] = time.time() - start_time
-        reset_needed = self.contexts[-1].sitl_commandline_customised
+        reset_needed = any(ctx.sitl_commandline_customised for ctx in self.contexts[old_contexts_length:])
 
         passed = True
         if ex is not None:
@@ -9507,8 +9492,13 @@ Also, ignores heartbeats not from our target system'''
                 self.reboot_sitl(startup_location_dist_max=1000000) # that'll learn it
             passed = False
         elif ardupilot_alive and not passed:  # implicit reboot after a failed test:
-            self.progress("Test failed but ArduPilot process alive; rebooting")
-            self.reboot_sitl() # that'll learn it
+            if reset_needed:
+                self.progress("Test failed but ArduPilot process alive; resetting")
+                self.reset_SITL_commandline()
+                reset_needed = False
+            else:
+                self.progress("Test failed but ArduPilot process alive; rebooting")
+                self.reboot_sitl() # that'll learn it
 
         if self._mavproxy is not None:
             self.progress("Stopping auto-started mavproxy")
@@ -10927,6 +10917,7 @@ Also, ignores heartbeats not from our target system'''
             self.arm_vehicle()
             tstart = self.get_sim_time()
             last_status = 0
+            low_rate_count = 0
             mavproxy.send('repeat add 1 dataflash_logger status\n')
             while True:
                 now = self.get_sim_time()
@@ -10942,7 +10933,11 @@ Also, ignores heartbeats not from our target system'''
                     if self.valgrind or self.callgrind:
                         desired_rate /= 10
                     if rate < desired_rate:
-                        raise NotAchievedException("Exceptionally low transfer rate (%u < %u)" % (rate, desired_rate))
+                        low_rate_count += 1
+                        if low_rate_count >= 2:
+                            raise NotAchievedException("Exceptionally low transfer rate (%u < %u)" % (rate, desired_rate))
+                    else:
+                        low_rate_count = 0
             self.disarm_vehicle()
             mavproxy.send('repeat remove 0\n')
         except Exception as e:  # noqa: BLE001
@@ -11078,87 +11073,113 @@ Also, ignores heartbeats not from our target system'''
         if herrors > header_errors:
             raise NotAchievedException("Error parsing log file %s, %d header errors" % (logname, herrors))
 
+    def assert_current_log_filesizes(self, sizes):
+        file_list = self.download_full_log_list(LOG_ENTRY_sanity_check=False)
+        self.progress(f"List: {file_list}")
+        for file_id, minmax in sizes.items():
+            (minsize, maxsize) = minmax
+            if file_id not in file_list:
+                raise NotAchievedException(f"{file_id} not in downloaded log info")
+            m = file_list[file_id]
+            if m.size < minsize:
+                raise NotAchievedException(f"{file_id} too small; got={m.size} want>{minsize}")
+            if m.size > maxsize:
+                raise NotAchievedException(f"{file_id} too large; got={m.size} want<{maxsize}")
+
     def DataFlashErase(self):
         """Test that erasing the dataflash chip and creating a new log is error free"""
-        mavproxy = self.start_mavproxy()
-
-        ex = None
-        self.context_push()
-        try:
-            self.set_parameter("LOG_BACKEND_TYPE", 4)
-            self.reboot_sitl()
-            mavproxy.send("module load log\n")
-            mavproxy.send("log erase\n")
-            mavproxy.expect("Chip erase complete")
-            self.set_parameter("LOG_DISARMED", 1)
-            self.delay_sim_time(3, reason="LOG_DISARMED to take effect")
-            self.set_parameter("LOG_DISARMED", 0)
-            mavproxy.send("log download 1 logs/dataflash-log-erase.BIN\n")
-            mavproxy.expect("Finished downloading", timeout=120)
-            # read the downloaded log - it must parse without error
-            self.validate_log_file("logs/dataflash-log-erase.BIN")
-
-            self.start_subtest("Test file wrapping results in a valid file")
-            # roughly 4mb
-            self.set_parameter("LOG_FILE_DSRMROT", 1)
-            self.set_parameter("LOG_BITMASK", 131071)
-            self.wait_ready_to_arm()
-            if self.is_copter() or self.is_plane():
-                self.set_autodisarm_delay(0)
-            self.arm_vehicle()
-            self.delay_sim_time(30, reason="log data for wrap test")
-            self.disarm_vehicle()
-            # roughly 4mb
-            self.arm_vehicle()
-            self.delay_sim_time(30, reason="log data for wrap test")
-            self.disarm_vehicle()
-            # roughly 9mb, should wrap around
-            self.arm_vehicle()
-            self.delay_sim_time(50, reason="log data for wrap test")
-            self.disarm_vehicle()
-            # make sure we have finished logging
-            self.delay_sim_time(15, reason="logging to finish")
-            mavproxy.send("log list\n")
-            try:
-                mavproxy.expect("Log ([0-9]+)  numLogs ([0-9]+) lastLog ([0-9]+) size ([0-9]+)", timeout=120)
-            except pexpect.TIMEOUT as e:
-                if self.sitl_is_running():
-                    self.progress("SITL is running")
-                else:
-                    self.progress("SITL is NOT running")
-                raise NotAchievedException("Received %s" % str(e))
-            if int(mavproxy.match.group(2)) != 3:
-                raise NotAchievedException("Expected 3 logs got %s" % (mavproxy.match.group(2)))
-
-            mavproxy.send("log download 1 logs/dataflash-log-erase2.BIN\n")
-            mavproxy.expect("Finished downloading", timeout=120)
-            self.validate_log_file("logs/dataflash-log-erase2.BIN", 1)
-
-            mavproxy.send("log download latest logs/dataflash-log-erase3.BIN\n")
-            mavproxy.expect("Finished downloading", timeout=120)
-            self.validate_log_file("logs/dataflash-log-erase3.BIN", 1)
-
-            # clean up
-            mavproxy.send("log erase\n")
-            mavproxy.expect("Chip erase complete")
-
-            # clean up
-            mavproxy.send("log erase\n")
-            mavproxy.expect("Chip erase complete")
-
-        except Exception as e:  # noqa: BLE001
-            self.print_exception_caught(e)
-            ex = e
-
-        mavproxy.send("module unload log\n")
-
-        self.context_pop()
+        # we have to significantly reduce the data going into the
+        # blackbox chip - it is only 4MB in size and we persist
+        # logging for 15 seconds.  That means we can end up rotating
+        # the contents for size way too much.
+        self.set_parameters({
+            "LOG_DISARMED": 0,
+            "LOG_BACKEND_TYPE": 4,
+            "LOG_BITMASK": 14,
+            "SIM_SPEEDUP": 1,  # there's a wallclock-time thread involved!
+        })
         self.reboot_sitl()
 
-        self.stop_mavproxy(mavproxy)
+        mavproxy = self.start_mavproxy()
 
-        if ex is not None:
-            raise ex
+        mavproxy.send("module load log\n")
+        mavproxy.send("log erase\n")
+        mavproxy.expect("Chip erase complete")
+
+        self.set_autodisarm_delay(0)
+
+        self.progress("Creating a very short log")
+        self.wait_ready_to_arm()
+        self.set_parameter("DISARM_DELAY", 1)
+        self.arm_vehicle()
+        self.wait_disarmed()
+        self.delay_sim_time(15, reason="Allow log persistence to finish")
+        mavproxy.send("log download 1 logs/dataflash-log-erase.BIN\n")
+        mavproxy.expect("Finished downloading", timeout=120)
+        # read the downloaded log - it must parse without error
+        self.validate_log_file("logs/dataflash-log-erase.BIN")
+        self.assert_log_dsf_no_drops("logs/dataflash-log-erase.BIN")
+        self.assert_current_log_filesizes({
+            1: (1000*1024, 1100*1024),
+        })
+
+        self.start_subtest("Test rotation results in a valid file")
+        self.set_parameter("LOG_FILE_DSRMROT", 1)
+
+        self.progress("Appending to create larger log")
+        self.arm_vehicle()
+        self.wait_disarmed()
+        self.delay_sim_time(15, reason="Allow log persistence to finish")
+        self.assert_current_log_filesizes({
+            1: (1980*1024, 2020*1024),
+        })
+        self.progress("Creating a second log")
+        self.arm_vehicle()
+        self.wait_disarmed()
+        self.delay_sim_time(15, reason="Allow log persistence to finish")
+        self.assert_current_log_filesizes({
+            1: (1980*1024, 2020*1024),
+            2: (1000*1024, 1100*1024),
+        })
+
+        self.progress("Creating a very large log which wipes the other ones out")
+        self.context_collect('STATUSTEXT')
+        self.set_parameter("LOG_BITMASK", 131071)
+        self.set_parameter("DISARM_DELAY", 0)  # disabled
+        self.arm_vehicle()
+        self.wait_statustext('Chip full, logging stopped', check_context=True, timeout=60)
+        self.disarm_vehicle()
+
+        # make sure we have finished logging
+        self.delay_sim_time(15, reason="logging to finish")
+
+        self.assert_current_log_filesizes({
+            1: (3809996, 4109996),
+        })
+
+        mavproxy.send("log list\n")
+        try:
+            mavproxy.expect("Log ([0-9]+)  numLogs ([0-9]+) lastLog ([0-9]+) size ([0-9]+)", timeout=120)
+        except pexpect.TIMEOUT as e:
+            if self.sitl_is_running():
+                self.progress("SITL is running")
+            else:
+                self.progress("SITL is NOT running")
+            raise NotAchievedException("Received %s" % str(e))
+        if int(mavproxy.match.group(2)) != 1:
+            raise NotAchievedException("Expected 1 log got %s" % (mavproxy.match.group(2)))
+
+        mavproxy.send("log download 1 logs/dataflash-log-erase2.BIN\n")
+        mavproxy.expect("Finished downloading", timeout=120)
+        self.validate_log_file("logs/dataflash-log-erase2.BIN", header_errors=1)
+
+        # clean up
+        mavproxy.send("log erase\n")
+        mavproxy.expect("Chip erase complete")
+
+        # clean up
+        mavproxy.send("log erase\n")
+        mavproxy.expect("Chip erase complete")
 
     def ArmFeatures(self):
         '''Arm features'''
@@ -12910,8 +12931,40 @@ switch value'''
         return DFReader.DFReader_binary(path,
                                         zero_time_base=True)
 
+    def assert_log_dsf_no_drops(self, path):
+        """Assert that DSF.Dp (write-buffer drop count) is zero in the given log file"""
+        dfreader = self.dfreader_for_path(path)
+        dropped = 0
+        while True:
+            m = dfreader.recv_match(type='DSF')
+            if m is None:
+                break
+            dropped = m.Dp
+        self.progress("DSF dropcount in %s: %d" % (path, dropped))
+        if dropped != 0:
+            raise NotAchievedException("Expected zero dropped log messages in %s, got %d" % (path, dropped))
+
     def dfreader_for_current_onboard_log(self):
         return self.dfreader_for_path(self.current_onboard_log_filepath())
+
+    def assert_log_has_no_dropped_blocks(self, path):
+        '''check the DSF.Dp (dropped-block) counter in a dataflash log is
+        zero throughout.  A non-zero count means the logging backend could
+        not keep up and silently discarded log blocks; any log produced in
+        that state is incomplete and unusable (e.g. for Replay).'''
+        dfreader = self.dfreader_for_path(path)
+        max_dropped = 0
+        while True:
+            m = dfreader.recv_match(type='DSF')
+            if m is None:
+                break
+            max_dropped = max(max_dropped, m.Dp)
+        if max_dropped != 0:
+            raise NotAchievedException(
+                "Log (%s) has %u dropped block(s) (DSF.Dp); logging could not "
+                "keep up so the log is incomplete (try a lower --speedup)" %
+                (path, max_dropped))
+        self.progress("Log (%s) has no dropped blocks" % path)
 
     def current_onboard_log_contains_message(self, messagetype):
         self.progress("Checking (%s) for (%s)" %
@@ -13074,7 +13127,11 @@ switch value'''
                       (count, attempt_count))
         return (seen_ids, id_seq)
 
-    def test_parameters_download(self):
+    def ParametersDownload(self):
+        '''check parameter download gives a consistent result'''
+        if self.is_balancebot():
+            # same binary and parameters as Rover
+            return
         self.start_subtest("parameter download")
         target_system = self.sysid_thismav()
         target_component = 1
@@ -13111,12 +13168,23 @@ switch value'''
             raise NotAchievedException("Enable parameter did not increase no of parameters downloaded")
         self.end_subsubtest("enable download")
 
-    def test_parameters_mis_total(self):
-        self.start_subsubtest("parameter mis_total")
+    def ParametersMIS_TOTAL(self):
+        '''check the GCS cannot set the internal-use-only MIS_TOTAL parameter'''
+        if self.is_balancebot():
+            # same binary and parameters as Rover
+            return
         if self.is_tracker():
             # uses CMD_TOTAL not MIS_TOTAL, and it's in a scalr not a
             # group and it's generally all bad.
             return
+        # Disable the simulated GPS and reboot so the EKF never establishes
+        # home during this test.  When home is set, AP_AHRS::set_home() calls
+        # AP_Mission::write_home_to_storage(), which bumps MIS_TOTAL from 0 to
+        # 1.  If that landed between the reads below the test would
+        # intermittently fail with "Total has changed".
+        self.set_parameters({"SIM_GPS1_ENABLE": 0})
+        self.reboot_sitl()
+
         self.start_subtest("Ensure GCS is not able to set MIS_TOTAL")
         old_mt = self.get_parameter("MIS_TOTAL", attempts=20) # retries to avoid seeming race condition with MAVProxy
         ex = None
@@ -13176,21 +13244,15 @@ switch value'''
         if failures:
             raise NotAchievedException("AP_SUBGROUPVARPTR entries missing @Group:/@Path: annotations")
 
-    def test_parameter_documentation(self):
+    def ParameterDocumentation(self):
         '''ensure parameter documentation is valid'''
+        if self.is_balancebot():
+            # same binary and parameters as Rover
+            return
         self.start_subsubtest("Check all parameters are documented")
         self.test_parameter_documentation_get_all_parameters()
         self.start_subsubtest("Check AP_SUBGROUPVARPTR entries have documentation annotations")
         self.test_subgroupvarptr_annotated()
-
-    def Parameters(self):
-        '''general small tests for parameter system'''
-        if self.is_balancebot():
-            # same binary and parameters as Rover
-            return
-        self.test_parameter_documentation()
-        self.test_parameters_mis_total()
-        self.test_parameters_download()
 
     def disabled_tests(self):
         return {}
@@ -13413,7 +13475,7 @@ switch value'''
                          ("INS_ACC2OFFS", "SIM_ACC2_BIAS", pre_aofs[1], aofs[1]),
                          ("INS_ACCSCAL", "SIM_ACC1_SCAL", pre_ascale[0], ascale[0]),
                          ("INS_ACC2SCAL", "SIM_ACC2_SCAL", pre_ascale[1], ascale[1]),
-                         ("AHRS_TRIM", "SIM_ACC_TRIM", pre_atrim, atrim)]
+                         ("AHRS_TRIM", "SIM_BRD_TRIM", pre_atrim, atrim)]
             axes = ['X', 'Y', 'Z']
 
             # form the pre-calibration params
@@ -13489,8 +13551,8 @@ switch value'''
             "SIM_ACC2_BIAS_Z": 2.3,
             "AHRS_TRIM_X": 0.05,
             "AHRS_TRIM_Y": -0.03,
-            "SIM_ACC_TRIM_X": -0.04,
-            "SIM_ACC_TRIM_Y": 0.05,
+            "SIM_BRD_TRIM_X": -0.04,
+            "SIM_BRD_TRIM_Y": 0.05,
         })
         expected_parms = {
             "AHRS_TRIM_X": -0.04,
@@ -13602,8 +13664,8 @@ switch value'''
                     self.set_parameters({
                         'AHRS_TRIM_X': math.radians(r),
                         'AHRS_TRIM_Y': math.radians(p),
-                        "SIM_ACC_TRIM_X": math.radians(r),
-                        "SIM_ACC_TRIM_Y": math.radians(p),
+                        "SIM_BRD_TRIM_X": math.radians(r),
+                        "SIM_BRD_TRIM_Y": math.radians(p),
                     })
                     self.reboot_sitl()
                     self.ahrstrim_attitude_correctness_test_attitude(11)
@@ -13622,8 +13684,8 @@ switch value'''
                     self.set_parameters({
                         'AHRS_TRIM_X': math.radians(r),
                         'AHRS_TRIM_Y': math.radians(p),
-                        "SIM_ACC_TRIM_X": math.radians(r),
-                        "SIM_ACC_TRIM_Y": math.radians(p),
+                        "SIM_BRD_TRIM_X": math.radians(r),
+                        "SIM_BRD_TRIM_Y": math.radians(p),
                     })
                     self.reboot_sitl()
                     self.ahrstrim_attitude_correctness_test_attitude(ahrs_type)
@@ -14078,6 +14140,9 @@ switch value'''
 
     def FRSkyPassThroughSensorIDs(self):
         '''test FRSKy protocol's telem-passthrough functionality (sensor IDs)'''
+        # the terrain sensor (0x500B) validation compares the vehicle's
+        # height-above-terrain, so the autopilot needs terrain data:
+        self.install_terrain_handlers_context()
         self.set_parameters({
             "SERIAL5_PROTOCOL": 10, # serial5 is FRSky passthrough
             "RPM1_TYPE": 10, # enable RPM output
@@ -14241,7 +14306,8 @@ switch value'''
         self.customise_SITL_commandline([
             "--serial5=tcp:%u" % port # serial5 spews to localhost port
         ])
-        frsky = FRSkyPassThrough(("127.0.0.1", port))
+        frsky = FRSkyPassThrough(("127.0.0.1", port),
+                                 get_time=self.get_sim_time_cached)
         frsky.connect()
 
         sport_to_mavlite = SPortToMAVlite()
@@ -14853,6 +14919,25 @@ switch value'''
         # heading seemingly indefinitely.
         self.reboot_sitl()
 
+    def build_replay(self):
+        '''build the Replay tool with the same configuration as the vehicle
+        binary under test.
+
+        The Replay tool runs the EKF over the logged inputs and the test
+        requires its output to match the live solution bit-for-bit, so the
+        tool must be compiled identically to the vehicle.  Any compile-time
+        difference (num_aux_imus, ekf_single, postype_single, debug, ...)
+        changes the EKF result and makes replay diverge from the live log.
+
+        configure=True is forced because a preceding test (e.g. a CAN/periph
+        test) may have left the shared build directory configured for a
+        different board; we reconfigure for the sitl board but keep the
+        vehicle's configure options.'''
+        build_opts = copy.copy(self.build_opts)
+        build_opts["clean"] = False
+        build_opts["configure"] = True
+        util.build_SITL('tool/Replay', board='sitl', **build_opts)
+
     def run_replay(self, filepath):
         '''runs replay in filepath, returns filepath to Replay logfile'''
         util.run_cmd(
@@ -14990,6 +15075,78 @@ switch value'''
         if mavextra.angle_diff(want, got) > 20:
             raise NotAchievedException("quat pitch differs from attitude pitch; want=%f got=%f" %
                                        (want, got))
+
+    def assert_AHR2_log_matches_primary(self):
+        '''check the AHR2 dataflash message (the secondary AHRS estimate) is
+        present in the current onboard log, that it tracks the primary
+        estimate (ATT/POS) and that its logged quaternion is consistent
+        with its logged eulers.  AHR2 and ATT are co-logged at the same
+        rate so the most-recently-seen ATT/POS is a valid comparison.'''
+        dfreader = self.dfreader_for_current_onboard_log()
+        att = None
+        pos = None
+        checked_attitude = 0
+        checked_position = 0
+        while True:
+            m = dfreader.recv_match(type=['ATT', 'POS', 'AHR2'])
+            if m is None:
+                break
+            m_type = m.get_type()
+            if m_type == 'ATT':
+                att = m
+                continue
+            if m_type == 'POS':
+                pos = m
+                continue
+
+            # m_type == 'AHR2'; compare the secondary attitude against
+            # the primary (ATT):
+            if att is not None:
+                for (field, secondary, primary) in [
+                        ('roll', m.Roll, att.Roll),
+                        ('pitch', m.Pitch, att.Pitch),
+                        ('yaw', m.Yaw, att.Yaw),
+                ]:
+                    if abs(mavextra.angle_diff(secondary, primary)) > 15:
+                        raise NotAchievedException(
+                            "AHR2.%s (%f) does not match ATT.%s (%f)" %
+                            (field, secondary, field, primary))
+                checked_attitude += 1
+
+            # the logging reads estimates->quaternion directly, so check
+            # the logged quaternion is normalised and consistent with the
+            # logged eulers:
+            qmag = math.sqrt(m.Q1**2 + m.Q2**2 + m.Q3**2 + m.Q4**2)
+            if abs(qmag - 1) > 0.02:
+                raise NotAchievedException(
+                    "AHR2 quaternion not normalised (mag=%f)" % qmag)
+            euler = quaternion.Quaternion([m.Q1, m.Q2, m.Q3, m.Q4]).euler
+            for (field, from_euler, from_log) in [
+                    ('roll', math.degrees(euler[0]), m.Roll),
+                    ('pitch', math.degrees(euler[1]), m.Pitch),
+                    ('yaw', math.degrees(euler[2]), m.Yaw),
+            ]:
+                if abs(mavextra.angle_diff(from_euler, from_log)) > 10:
+                    raise NotAchievedException(
+                        "AHR2 quaternion %s (%f) inconsistent with euler (%f)" %
+                        (field, from_euler, from_log))
+
+            # the secondary position should be close to the primary (POS):
+            if pos is not None and m.Lat != 0 and m.Lng != 0:
+                secondary_loc = mavutil.location(m.Lat, m.Lng, 0, 0)
+                primary_loc = mavutil.location(pos.Lat, pos.Lng, 0, 0)
+                dist = self.get_distance(primary_loc, secondary_loc)
+                if dist > 50:
+                    raise NotAchievedException(
+                        "AHR2 position %fm from primary (POS)" % dist)
+                checked_position += 1
+
+        if checked_attitude == 0:
+            raise NotAchievedException("Found no AHR2 messages to check attitude")
+        if checked_position == 0:
+            raise NotAchievedException("Found no AHR2 messages to check position")
+        self.progress("Checked AHR2 log (attitude=%u position=%u)" %
+                      (checked_attitude, checked_position))
 
     def MultipleGPS(self):
         '''check ArduPilot behaviour across multiple GPS units'''
@@ -15274,6 +15431,93 @@ switch value'''
         self.ftp_recv(timeout=5)
 
         return data, eof_nack
+
+    def ftp_write_file(self, path, data):
+        '''write bytes to a remote path via MAVLink FTP (CreateFile + WriteFile)'''
+        data = bytearray(data)
+
+        # ResetSessions
+        op = FTP_OP(
+            seq=0, session=0, opcode=mavftp_op.OP_ResetSessions,
+            size=0, req_opcode=0, burst_complete=0, offset=0, payload=None,
+        )
+        self.ftp_send(op)
+        reply = self.ftp_recv(timeout=5)
+        if reply is None:
+            raise NotAchievedException("No reply to ResetSessions")
+        seq = reply.seq
+
+        # CreateFile (open write-truncate)
+        path_bytes = bytearray(path.encode('utf-8')) + bytearray([0])
+        op = FTP_OP(
+            seq=seq, session=0, opcode=mavftp_op.OP_CreateFile,
+            size=len(path_bytes), req_opcode=0, burst_complete=0,
+            offset=0, payload=path_bytes,
+        )
+        self.ftp_send(op)
+        reply = self.ftp_recv(timeout=5)
+        if reply is None:
+            raise NotAchievedException("No reply to CreateFile")
+        if reply.opcode != mavftp_op.OP_Ack:
+            raise NotAchievedException(f"CreateFile failed: opcode={reply.opcode}")
+        seq = reply.seq
+
+        # WriteFile in FTP_MAX_PAYLOAD-byte chunks
+        offset = 0
+        while offset < len(data):
+            chunk = data[offset:offset + FTP_MAX_PAYLOAD]
+            op = FTP_OP(
+                seq=seq, session=0, opcode=mavftp_op.OP_WriteFile,
+                size=len(chunk), req_opcode=0, burst_complete=0,
+                offset=offset, payload=chunk,
+            )
+            self.ftp_send(op)
+            reply = self.ftp_recv(timeout=5)
+            if reply is None:
+                raise NotAchievedException(f"No reply to WriteFile at offset {offset}")
+            if reply.opcode != mavftp_op.OP_Ack:
+                raise NotAchievedException(f"WriteFile failed at offset {offset}: opcode={reply.opcode}")
+            seq = reply.seq
+            offset += len(chunk)
+
+        # TerminateSession
+        op = FTP_OP(
+            seq=seq, session=0, opcode=mavftp_op.OP_TerminateSession,
+            size=0, req_opcode=0, burst_complete=0, offset=0, payload=None,
+        )
+        self.ftp_send(op)
+        self.ftp_recv(timeout=5)
+
+    def ftp_create_directory(self, path):
+        '''create a remote directory via MAVLink FTP; ignores error if it already exists'''
+        path_bytes = bytearray(path.encode('utf-8')) + bytearray([0])
+        op = FTP_OP(
+            seq=0, session=0, opcode=mavftp_op.OP_CreateDirectory,
+            size=len(path_bytes), req_opcode=0, burst_complete=0,
+            offset=0, payload=path_bytes,
+        )
+        self.ftp_send(op)
+        reply = self.ftp_recv(timeout=5)
+        if reply is None:
+            raise NotAchievedException("No reply to CreateDirectory")
+        # Nack is acceptable if directory already exists
+        if reply.opcode not in (mavftp_op.OP_Ack, mavftp_op.OP_Nack):
+            raise NotAchievedException(f"CreateDirectory unexpected opcode={reply.opcode}")
+
+    def ftp_remove_file(self, path):
+        '''remove a remote file via MAVLink FTP (RemoveFile)'''
+        path_bytes = bytearray(path.encode('utf-8')) + bytearray([0])
+        op = FTP_OP(
+            seq=0, session=0, opcode=mavftp_op.OP_RemoveFile,
+            size=len(path_bytes), req_opcode=0, burst_complete=0,
+            offset=0, payload=path_bytes,
+        )
+        self.ftp_send(op)
+        reply = self.ftp_recv(timeout=5)
+        if reply is None:
+            raise NotAchievedException("No reply to RemoveFile")
+        if reply.opcode != mavftp_op.OP_Ack:
+            raise NotAchievedException(f"RemoveFile failed for {path}: opcode={reply.opcode}")
 
     def verify_ftp_burst_eof(self, data, eof_nack, expected_size, label):
         '''verify burst read EOF NAK is correct'''
@@ -16105,7 +16349,9 @@ SERIAL5_BAUD 128
             self.SetHome,
             self.ConfigErrorLoop,
             self.CPUFailsafe,
-            self.Parameters,
+            self.ParameterDocumentation,
+            self.ParametersMIS_TOTAL,
+            self.ParametersDownload,
             self.LoggerDocumentation,
             self.Logging,
             self.GetCapabilities,
