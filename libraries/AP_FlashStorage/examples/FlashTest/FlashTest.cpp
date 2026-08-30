@@ -65,7 +65,7 @@ bool FlashTest::flash_write(uint8_t sector, uint32_t offset, const uint8_t *data
     for (uint16_t i=0; i<len16; i++) {
         const uint16_t v = le16toh_ptr(&data[i*2]);
         uint16_t v2 = le16toh_ptr(&b[i*2]);
-        if (v & !v2) {
+        if (v & ~v2) {
             AP_HAL::panic("FATAL: invalid write16 at %u:%u 0x%04x 0x%04x",
                           (unsigned)sector,
                           unsigned(offset+i),
